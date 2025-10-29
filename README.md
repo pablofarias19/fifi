@@ -194,6 +194,19 @@ extract_jurisdiction = True      # Extraer jurisdicción
 use_llm_metadata = False         # Usar Gemini para metadata (lento pero preciso)
 ```
 
+### 📝 Personalizar el prompt de análisis
+
+- Edita el archivo `prompts/analisis_salud.md` para ajustar las instrucciones sin tocar el código.
+- También puedes apuntar a otro archivo estableciendo la variable de entorno `ANALYSIS_PROMPT_FILE` con la ruta al prompt deseado (se acepta `~` para rutas relativas al home).
+
+### 🩹 Aplicar parches manualmente
+
+Si recibes un parche (`diff`) para actualizar el repositorio, cópialo **completo**, incluyendo los encabezados `diff --git`, `index`, `---` y `+++`. Al aplicar el parche con `git apply` o `patch`, esos encabezados le indican a Git qué archivo debe modificar y cómo ubicar los cambios. Si se copia únicamente la parte marcada con `+` y `-`, el parche no contendrá el contexto necesario y fallará al aplicarse.
+  ```bash
+  export ANALYSIS_PROMPT_FILE="~/prompts/analisis_procesal.md"
+  ```
+- Si la ruta es inválida o el archivo no existe, el sistema empleará el prompt por defecto incluido en el proyecto.
+
 ## 🔍 Extracción Avanzada de Metadatos
 
 ### Metadatos Detectados Automáticamente
