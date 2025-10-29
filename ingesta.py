@@ -130,10 +130,14 @@ class MetadataEnriquecido:
     fecha_sentencia: Optional[str] = None
     fecha_resolucion: Optional[str] = None
 
-    # Metadata documental
+    # Metadata documental (⭐ NUEVOS CAMPOS)
     autor: str = ""
+    titulo: str = ""              # ⭐ Título del documento
+    anio: Optional[str] = None    # ⭐ Año del documento
     idioma: str = "es"
     resumen: str = ""
+    url: str = ""                 # ⭐ URL si está disponible
+    num_paginas: int = 0          # ⭐ Número de páginas del PDF
 
     # Estadísticas
     tokens: int = 0
@@ -143,6 +147,7 @@ class MetadataEnriquecido:
 
     # Observaciones
     observaciones: str = ""
+    metodo_deteccion: str = "regex"  # ⭐ "regex" o "llm" para trazabilidad
 
     def to_dict(self) -> dict:
         return {
@@ -156,6 +161,10 @@ class MetadataEnriquecido:
             "resumen": self.resumen,
             "tokens": self.tokens,
             "autor": self.autor,
+            "titulo": self.titulo,
+            "anio": self.anio,
+            "url": self.url,
+            "num_paginas": self.num_paginas,
             "jurisdiccion": self.jurisdiccion,
             "tribunal": self.tribunal,
             "expediente": self.expediente,
@@ -165,7 +174,8 @@ class MetadataEnriquecido:
             "fecha_resolucion": self.fecha_resolucion,
             "fragmentos_extraidos": self.fragmentos_extraidos,
             "fragmentos_validos": self.fragmentos_validos,
-            "score_promedio": self.score_promedio
+            "score_promedio": self.score_promedio,
+            "metodo_deteccion": self.metodo_deteccion
         }
 
 # ======================
@@ -277,18 +287,318 @@ def classify_document(text: str) -> str:
     return TipoDocumento.DESCONOCIDO.value
 
 
-def detect_metadata_enriched(pdf_path: Path, text: str) -> MetadataEnriquecido:
-    """Extrae metadatos del PDF y texto"""
+# ======================
+# Detección Avanzada de Metadata
+# ======================
+
+def detect_author_advanced(text: str) -> Optional[str]:
+    """
+    Detecta autor con patrones mejorados.
+
+    Patrones soportados:
+    - "Autor: Dr. Juan Pérez"
+    - "Autores: María García y Juan López"
+    - "Dr./Dra./Prof. Nombre Apellido"
+    - "Por: Nombre Apellido"
+    """
+    # Limpiar y tomar primeras 2000 caracteres (el autor suele estar al inicio)
+    sample = text[:2000]
+
+    patterns = [
+        r"(?:Autor(?:es)?|Por):\s*(?:Dr\.|Dra\.|Prof\.)?\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})",
+        r"(?:Dr\.|Dra\.|Prof\.)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)",
+        r"(?:Firmado|Suscrito)\s+por:?\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, sample, re.IGNORECASE)
+        if match:
+            autor = match.group(1).strip()
+            # Validar que no sea muy corto ni muy largo
+            if 5 <= len(autor) <= 50:
+                return autor
+
+    return None
+
+
+def detect_title_advanced(text: str) -> Optional[str]:
+    """
+    Detecta título del documento.
+
+    Estrategias:
+    1. Primera línea en mayúsculas (mín 10 chars)
+    2. Línea entre "TÍTULO:" o similar
+    3. Primera línea con formato título (Title Case)
+    """
+    lines = [l.strip() for l in text[:1500].split("\n") if l.strip()]
+
+    if not lines:
+        return None
+
+    # Estrategia 1: Buscar patrón "TÍTULO:" o similar
+    for i, line in enumerate(lines[:10]):
+        if re.match(r"(?i)^(?:t[íi]tulo|asunto|materia):\s*(.+)", line):
+            titulo = re.match(r"(?i)^(?:t[íi]tulo|asunto|materia):\s*(.+)", line).group(1)
+            if 10 <= len(titulo) <= 200:
+                return titulo
+
+    # Estrategia 2: Primera línea en mayúsculas
+    for line in lines[:5]:
+        if line.isupper() and 10 <= len(line) <= 200:
+            return line
+
+    # Estrategia 3: Primera línea con formato de título (inicia con mayúscula)
+    for line in lines[:3]:
+        if line[0].isupper() and 10 <= len(line) <= 200:
+            # Verificar que no sea una frase común
+            if not any(skip in line.lower() for skip in ["visto", "autos", "considerando", "resultando"]):
+                return line
+
+    return None
+
+
+def detect_year_advanced(text: str) -> Optional[str]:
+    """
+    Detecta año del documento.
+
+    Busca años entre 1900-2099, priorizando:
+    1. Años en contexto de fecha formal
+    2. Año más frecuente en el documento
+    """
+    # Buscar todos los años (1900-2099)
+    years = re.findall(r"\b(19\d{2}|20\d{2})\b", text)
+
+    if not years:
+        return None
+
+    # Buscar año en contexto de fecha formal (más confiable)
+    formal_date_patterns = [
+        r"(?:de|del año|año)\s+(19\d{2}|20\d{2})",
+        r"(19\d{2}|20\d{2})\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{1,2}",
+        r"\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*(19\d{2}|20\d{2})",
+    ]
+
+    for pattern in formal_date_patterns:
+        matches = re.findall(pattern, text[:2000])
+        if matches:
+            # Devolver el año más reciente en contexto formal
+            return max(matches)
+
+    # Si no hay contexto formal, devolver año más frecuente
+    from collections import Counter
+    year_counts = Counter(years)
+    most_common_year = year_counts.most_common(1)[0][0]
+
+    return most_common_year
+
+
+def detect_jurisdiction_advanced(text: str) -> Optional[str]:
+    """
+    Detecta jurisdicción (provincia/país).
+
+    Busca:
+    - Provincias argentinas
+    - Ciudades principales
+    - País si es internacional
+    """
+    sample = text[:3000]
+
+    # Provincias argentinas
+    provincias = [
+        "Buenos Aires", "CABA", "Ciudad Autónoma de Buenos Aires",
+        "Córdoba", "Santa Fe", "Mendoza", "Tucumán", "Entre Ríos",
+        "Salta", "Chaco", "Corrientes", "Misiones", "San Juan",
+        "Jujuy", "Río Negro", "Neuquén", "Formosa", "Chubut",
+        "San Luis", "Catamarca", "La Rioja", "La Pampa",
+        "Santa Cruz", "Tierra del Fuego"
+    ]
+
+    # Buscar provincia en contexto
+    for provincia in provincias:
+        patterns = [
+            rf"\b{re.escape(provincia)}\b",
+            rf"Provincia\s+de\s+{re.escape(provincia)}",
+            rf"Juzgado.*{re.escape(provincia)}",
+            rf"Tribunal.*{re.escape(provincia)}",
+        ]
+
+        for pattern in patterns:
+            if re.search(pattern, sample, re.IGNORECASE):
+                return provincia
+
+    # Buscar "Argentina" si no hay provincia
+    if re.search(r"\bArgentina\b", sample):
+        return "Argentina"
+
+    return None
+
+
+def detect_language(text: str) -> str:
+    """
+    Detecta idioma del texto usando langdetect.
+    Fallback a "es" si falla la detección.
+    """
+    try:
+        # Intentar importar langdetect
+        from langdetect import detect, LangDetectException
+
+        # Muestrear hasta 2000 caracteres
+        sample = text[:2000]
+
+        if not sample.strip():
+            return "es"
+
+        lang = detect(sample)
+
+        # Mapear códigos a los soportados
+        if lang in IDIOMAS_VALIDOS:
+            return lang
+
+        # Si no está en lista válida, devolver español por defecto
+        return "es"
+
+    except (ImportError, LangDetectException, Exception):
+        # Si langdetect no está instalado o falla, devolver español
+        return "es"
+
+
+def extract_pdf_metadata(pdf_path: Path) -> dict:
+    """
+    Extrae metadata del PDF (número de páginas, metadata del archivo).
+
+    Returns:
+        dict con: num_paginas, autor_pdf, titulo_pdf, etc.
+    """
+    metadata = {
+        "num_paginas": 0,
+        "autor_pdf": None,
+        "titulo_pdf": None,
+    }
+
+    try:
+        if _HAS_PDFPLUMBER:
+            with pdfplumber.open(pdf_path) as pdf:
+                metadata["num_paginas"] = len(pdf.pages)
+
+                # Intentar extraer metadata del PDF
+                if hasattr(pdf, "metadata") and pdf.metadata:
+                    metadata["autor_pdf"] = pdf.metadata.get("Author", None)
+                    metadata["titulo_pdf"] = pdf.metadata.get("Title", None)
+
+        elif _HAS_PYPDF2:
+            with open(pdf_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                metadata["num_paginas"] = len(reader.pages)
+
+                if reader.metadata:
+                    metadata["autor_pdf"] = reader.metadata.get("/Author", None)
+                    metadata["titulo_pdf"] = reader.metadata.get("/Title", None)
+
+    except Exception as e:
+        log.warning(f"No se pudo extraer metadata del PDF: {e}")
+
+    return metadata
+
+
+def extract_metadata_with_llm(text: str, pdf_path: Path, config: IngestaConfig) -> dict:
+    """
+    Extrae metadatos usando Gemini Pro (opcional, lento pero preciso).
+
+    Args:
+        text: Texto del documento
+        pdf_path: Ruta al PDF
+        config: Configuración de ingesta
+
+    Returns:
+        dict con metadatos extraídos por LLM
+    """
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        import os
+
+        # Verificar API key
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if not api_key:
+            log.warning("GOOGLE_API_KEY no configurada, saltando extracción con LLM")
+            return {}
+
+        # Inicializar LLM
+        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.1)
+
+        # Muestrear texto
+        sample = text[:config.llm_metadata_sample_size]
+
+        prompt = f"""
+        Extrae los siguientes metadatos del texto jurídico-sanitario.
+        Si no encuentras algún dato, devuelve null.
+
+        Texto:
+        {sample}
+
+        Devuelve SOLO un objeto JSON válido con esta estructura exacta:
+        {{
+            "autor": "nombre completo del autor o autores",
+            "titulo": "título completo del documento",
+            "anio": "año del documento en formato YYYY",
+            "jurisdiccion": "provincia o jurisdicción",
+            "tipo": "tipo de documento",
+            "tribunal": "nombre del tribunal si aplica",
+            "expediente": "número de expediente si existe"
+        }}
+        """
+
+        response = llm.invoke(prompt)
+        text_response = response.content if hasattr(response, "content") else str(response)
+
+        # Extraer JSON
+        import json
+        json_match = re.search(r'\{.*\}', text_response, re.DOTALL)
+        if json_match:
+            metadata = json.loads(json_match.group(0))
+            return metadata
+
+        return {}
+
+    except Exception as e:
+        log.warning(f"Error en extracción con LLM: {e}")
+        return {}
+
+
+def detect_metadata_enriched(
+    pdf_path: Path,
+    text: str,
+    config: IngestaConfig = DEFAULT_INGESTA_CONFIG
+) -> MetadataEnriquecido:
+    """
+    Extrae metadatos del PDF y texto usando detección avanzada.
+
+    Args:
+        pdf_path: Ruta al PDF
+        text: Texto extraído del PDF
+        config: Configuración de ingesta
+
+    Returns:
+        MetadataEnriquecido con todos los campos detectados
+    """
     # Hash del PDF
     with open(pdf_path, "rb") as f:
         h = hashlib.md5(f.read()).hexdigest()
 
     meta = MetadataEnriquecido(archivo_origen=pdf_path.name, hash_pdf=h)
+
+    # === EXTRACCIÓN CON LLM (OPCIONAL) ===
+    llm_metadata = {}
+    if config.use_llm_metadata:
+        log.info("Extrayendo metadata con Gemini...")
+        llm_metadata = extract_metadata_with_llm(text, pdf_path, config)
+        meta.metodo_deteccion = "llm"
+
+    # === DETECCIÓN BÁSICA (SIEMPRE) ===
     meta.tipo_documento = classify_document(text)
 
     # Expediente
     mexp = re.search(_PATTERNS["expediente"], text)
-    meta.expediente = mexp.group(2) if mexp else None
+    meta.expediente = llm_metadata.get("expediente") or (mexp.group(2) if mexp else None)
 
     # Fechas
     mfecha = re.search(_PATTERNS["fecha"], text)
@@ -301,7 +611,57 @@ def detect_metadata_enriched(pdf_path: Path, text: str) -> MetadataEnriquecido:
 
     # Tribunal
     mtrib = re.search(_PATTERNS["tribunal"], text)
-    meta.tribunal = mtrib.group(0) if mtrib else None
+    meta.tribunal = llm_metadata.get("tribunal") or (mtrib.group(0) if mtrib else None)
+
+    # === EXTRACCIÓN DE METADATA DEL PDF ===
+    pdf_meta = extract_pdf_metadata(pdf_path)
+    meta.num_paginas = pdf_meta["num_paginas"]
+
+    # === DETECCIÓN AVANZADA (SEGÚN CONFIGURACIÓN) ===
+
+    # Autor
+    if config.extract_author:
+        meta.autor = (
+            llm_metadata.get("autor") or
+            pdf_meta.get("autor_pdf") or
+            detect_author_advanced(text) or
+            ""
+        )
+
+    # Título
+    if config.extract_title:
+        meta.titulo = (
+            llm_metadata.get("titulo") or
+            pdf_meta.get("titulo_pdf") or
+            detect_title_advanced(text) or
+            ""
+        )
+
+    # Año
+    if config.extract_year:
+        meta.anio = (
+            llm_metadata.get("anio") or
+            detect_year_advanced(text)
+        )
+
+    # Jurisdicción
+    if config.extract_jurisdiction:
+        meta.jurisdiccion = (
+            llm_metadata.get("jurisdiccion") or
+            detect_jurisdiction_advanced(text) or
+            ""
+        )
+
+    # Idioma
+    if config.detect_language:
+        meta.idioma = detect_language(text)
+
+    # Log de resultados
+    log.info(
+        f"Metadata detectada: autor={bool(meta.autor)}, "
+        f"titulo={bool(meta.titulo)}, año={meta.anio}, "
+        f"jurisdiccion={bool(meta.jurisdiccion)}, idioma={meta.idioma}"
+    )
 
     return meta
 
@@ -423,8 +783,8 @@ def ingest_pdf_to_chroma(
     # 4. Deduplicar
     docs = _dedup_by_hash(docs)
 
-    # 5. Metadata enriquecida
-    meta_doc = detect_metadata_enriched(pdf_path, text)
+    # 5. Metadata enriquecida (⭐ CON DETECCIÓN AVANZADA)
+    meta_doc = detect_metadata_enriched(pdf_path, text, config)
     meta_doc.materia = materia or base_nombre
     meta_doc.fragmentos_extraidos = len(docs)
 
@@ -432,7 +792,7 @@ def ingest_pdf_to_chroma(
         meta_doc.score_promedio = sum(d.metadata.get("score_calidad", 0.5) for d in docs) / len(docs)
         meta_doc.fragmentos_validos = len(docs)
 
-    # 6. Asignar metadata a cada fragmento
+    # 6. Asignar metadata a cada fragmento (⭐ INCLUYE NUEVOS CAMPOS)
     for d in docs:
         d.metadata.update({
             "archivo_origen": meta_doc.archivo_origen,
@@ -444,7 +804,16 @@ def ingest_pdf_to_chroma(
             "fecha_sentencia": meta_doc.fecha_sentencia,
             "fecha_resolucion": meta_doc.fecha_resolucion,
             "fecha_ingestion": meta_doc.fecha_ingestion,
-            "base_nombre": base_nombre
+            "base_nombre": base_nombre,
+            # ⭐ NUEVOS METADATOS
+            "autor": meta_doc.autor,
+            "titulo": meta_doc.titulo,
+            "anio": meta_doc.anio,
+            "jurisdiccion": meta_doc.jurisdiccion,
+            "idioma": meta_doc.idioma,
+            "url": meta_doc.url,
+            "pagina": "1",  # Por defecto (cada fragmento viene de múltiples páginas)
+            "num_paginas": meta_doc.num_paginas,
         })
 
     # 7. Gestionar versión
