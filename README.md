@@ -37,6 +37,16 @@ Sistema de análisis jurídico-médico basado en RAG (Retrieval-Augmented Genera
 - **Extracción opcional con Gemini** para máxima precisión (~95%)
 - **Metadata enriquecida** en cada fragmento para mejor recuperación RAG
 
+### ✅ Sistema de Historial Robusto (⭐ NUEVO)
+- **Almacenamiento de PDFs originales** con UUID único
+- **Trazabilidad completa**: documento + análisis + metadata
+- **Validación de texto extraído** antes de análisis
+- **Botones de descarga corregidos** (sin corrupción)
+- **Limpieza automática** de archivos >30 días
+- **Gestión de espacio** con estadísticas en tiempo real
+- **Re-análisis** sin volver a subir archivos
+- **Exportación robusta** de reportes PDF del historial
+
 ## 📁 Estructura del Proyecto
 
 ```
@@ -59,6 +69,9 @@ fifi/
 │   ├── pdfs_jurisprud_salud/
 │   ├── pdfs_ley_salud/
 │   └── registry.json            # ⭐ Registro de versiones
+├── historial_archivos/          # ⭐ PDFs originales del historial
+│   └── *.pdf                    # Guardados con UUID único
+├── historial_salud.json         # ⭐ Metadata de análisis guardados
 ├── pdfs/                        # PDFs fuente
 └── logs/                        # Logs del sistema
 ```
@@ -247,6 +260,93 @@ El sistema usa **cascada inteligente** para cada campo:
   "metodo_deteccion": "regex"
 }
 ```
+
+## 🗂️ Sistema de Historial Robusto
+
+### Características del Historial
+
+El sistema de historial ha sido completamente rediseñado para garantizar:
+
+**✅ Trazabilidad completa:**
+- PDFs originales guardados con UUID único
+- Texto completo extraído (no solo resumen)
+- Metadata del análisis
+- Auditorías de bases vectoriales
+- Timestamp de cada operación
+
+**✅ Validaciones robustas:**
+- Verifica que el PDF no esté corrupto
+- Valida que se extrajo texto (mínimo 50 caracteres)
+- Detecta PDFs escaneados sin OCR
+
+**✅ Gestión de archivos:**
+- Limpieza automática de archivos >30 días
+- Estadísticas en tiempo real (cantidad de PDFs, espacio usado)
+- Vaciado completo del historial con confirmación
+
+### Uso del Historial en Streamlit
+
+#### 1. Guardar análisis
+```
+1. Realizar análisis (texto o PDF)
+2. Click en "💾 Guardar en historial"
+3. Se guarda: PDF original + texto completo + resultado + auditorías
+```
+
+#### 2. Revisar análisis anteriores
+```
+Sección "🗂️ Historial de análisis anteriores"
+├── Ver lista de análisis con timestamp
+├── 📖 Ver detalle: Muestra JSON completo del resultado
+├── 📤 Exportar a PDF: Genera reporte con texto completo
+└── 📥 Descargar PDF original: Recupera el archivo original (si existe)
+```
+
+#### 3. Gestionar espacio
+```
+"ℹ️ Información del sistema" → Gestión de historial
+├── Estadísticas: Cantidad de PDFs y MB usados
+├── 🧹 Limpiar archivos >30 días
+└── 🗑️ Vaciar historial completo (requiere confirmación)
+```
+
+### Estructura de Registro
+
+Cada análisis guardado contiene:
+
+```json
+{
+  "timestamp": "2025-10-29T15:30:00",
+  "modo": "Archivo PDF",
+  "entrada_resumen": "Primeros 400 caracteres...",
+  "entrada_completa": "Texto completo del PDF extraído...",
+  "archivo_original": "historial_archivos/uuid-123.pdf",
+  "archivo_nombre": "informe_medico.pdf",
+  "resultado": {
+    "tesis": "...",
+    "conceptos_clave": [...],
+    "debilidades": [...],
+    "preguntas": [...],
+    "probabilidad_exito": "alta",
+    "fuentes_relevantes": [...]
+  },
+  "auditorias": [...]
+}
+```
+
+### Correcciones Implementadas
+
+**Problema 1: Contenido de PDF no guardado** ✅ **SOLUCIONADO**
+- Antes: Solo guardaba "PDF subido: nombre.pdf"
+- Ahora: Guarda texto completo extraído en `entrada_completa`
+
+**Problema 2: Botones de descarga fallaban** ✅ **SOLUCIONADO**
+- Antes: Archivo se cerraba antes de enviar
+- Ahora: Lee bytes completos antes de crear botón
+
+**Problema 3: PDFs corruptos sin validación** ✅ **SOLUCIONADO**
+- Ahora: Valida texto extraído antes de procesar
+- Muestra error claro si el PDF está corrupto o sin OCR
 
 ## 📊 Sistema de Versionado
 
