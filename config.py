@@ -84,6 +84,15 @@ class IngestaConfig:
     auto_version: bool = True  # Auto-incrementar versión en cambios
     create_backup: bool = True  # Backup antes de modificar
 
+    # Parámetros de extracción de metadata
+    detect_language: bool = True           # Detectar idioma automáticamente
+    extract_author: bool = True            # Intentar extraer autor
+    extract_title: bool = True             # Intentar extraer título
+    extract_year: bool = True              # Intentar extraer año
+    extract_jurisdiction: bool = True      # Intentar extraer jurisdicción
+    use_llm_metadata: bool = False         # Usar Gemini para extraer metadata (lento pero preciso)
+    llm_metadata_sample_size: int = 3000   # Tamaño de muestra de texto para LLM
+
 # ======================
 # PARÁMETROS DE ANÁLISIS
 # ======================
