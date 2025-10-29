@@ -194,6 +194,15 @@ extract_jurisdiction = True      # Extraer jurisdicción
 use_llm_metadata = False         # Usar Gemini para metadata (lento pero preciso)
 ```
 
+### 📝 Personalizar el prompt de análisis
+
+- Edita el archivo `prompts/analisis_salud.md` para ajustar las instrucciones sin tocar el código.
+- También puedes apuntar a otro archivo estableciendo la variable de entorno `ANALYSIS_PROMPT_FILE` con la ruta al prompt deseado (se acepta `~` para rutas relativas al home).
+  ```bash
+  export ANALYSIS_PROMPT_FILE="~/prompts/analisis_procesal.md"
+  ```
+- Si la ruta es inválida o el archivo no existe, el sistema empleará el prompt por defecto incluido en el proyecto.
+
 ## 🔍 Extracción Avanzada de Metadatos
 
 ### Metadatos Detectados Automáticamente
