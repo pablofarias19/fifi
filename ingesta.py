@@ -1,69 +1,65 @@
 # -*- coding: utf-8 -*-
 """
-INGESTA MEJORADA AUTÓNOMA (jurídica)
-------------------------------------
+INGESTA MEJORADA CON VERSIONADO (jurídica)
+-------------------------------------------
 - OCR opcional (pytesseract + pdf2image)
 - Extracción texto (pdfplumber / PyPDF2)
 - Segmentación jurídica (considerandos, artículos, resolutivos, etc.)
 - Validación + deduplicación por hash y score
-- Almacenamiento en Chroma (vectorstore)
-- Settings centralizada
-- Funciones clave exportadas:
-    extract_text_from_pdf()
-    validate_pdf()
-    classify_document()
-    detect_metadata_enriched()
-- Lista de bases RAG por materia (BASES_RAG)
-- Modular y compatible con: LangChain, Chroma, Streamlit y analyser.py
+- Almacenamiento en Chroma con versionado automático
+- Integración completa con version_manager
 """
 
 from __future__ import annotations
-import os, re, io, gc, json, hashlib, logging
-from dataclasses import dataclass, field
+import re, hashlib, logging, json, uuid
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
+from dataclasses import dataclass, field
 from datetime import datetime
-import uuid
 from enum import Enum
+
+# Imports de config centralizado
+from config import (
+    LOGS_DIR, IDIOMAS_VALIDOS, BASES_RAG,
+    IngestaConfig, DEFAULT_INGESTA_CONFIG
+)
+
+# Sistema de versionado
+from version_manager import (
+    REGISTRY, BaseVersion, create_version_directory, get_version_directory
+)
+from embedding_validator import VALIDATOR
 
 # ---------- Dependencias PDF / OCR ----------
 try:
     import pdfplumber
     _HAS_PDFPLUMBER = True
-except Exception:
+except ImportError:
     _HAS_PDFPLUMBER = False
 
 try:
     import PyPDF2
     _HAS_PYPDF2 = True
-except Exception:
+except ImportError:
     _HAS_PYPDF2 = False
 
 try:
     from pdf2image import convert_from_path
     import pytesseract
     _HAS_OCR_STACK = True
-except Exception:
+except ImportError:
     _HAS_OCR_STACK = False
 
 # ---------- LangChain / Chroma ----------
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings as SentenceTransformerEmbeddings
 from langchain_chroma import Chroma
 
-
 # ======================
-# Rutas y logging
+# Logging
 # ======================
 
-ROOT = Path(__file__).parent
-PDF_DIR_DEFAULT = ROOT / "pdfs"
-DB_DIR_DEFAULT = ROOT / "chroma_db_legal"
-CACHE_DIR_DEFAULT = ROOT / "chroma_cache"
-LOGS_DIR = ROOT / "logs"
-for d in [PDF_DIR_DEFAULT, DB_DIR_DEFAULT, CACHE_DIR_DEFAULT, LOGS_DIR]:
-    d.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
 
 def make_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -78,29 +74,11 @@ def make_logger(name: str) -> logging.Logger:
 log = make_logger("ingesta")
 
 # ======================
-# Idiomas y configuración global
-# ======================
-
-IDIOMAS_VALIDOS = ["en", "de", "es", "fr", "it"]
-LANG_TESSERACT = "spa+eng+fra+ita+deu"  # OCR multilingüe
-
-# ======================
-# Bases RAG disponibles
-# ======================
-
-BASES_RAG: Dict[str, str] = {
-    "Salud - Médica": "pdfs_salud_medica",
-    "Salud - Laboral": "pdfs_salud_laboral",
-    "Jurisprudencia - Salud": "pdfs_jurisprud_salud",
-    "Legislación - Salud": "pdfs_ley_salud"
-}
-
-
-# ======================
-# Settings y tipos
+# Tipos de Documentos
 # ======================
 
 class TipoDocumento(str, Enum):
+    """Tipos de documentos jurídicos reconocidos"""
     SENTENCIA = "sentencia"
     FALLO = "fallo"
     DECRETO = "decreto"
@@ -113,56 +91,6 @@ class TipoDocumento(str, Enum):
     ESCRITO = "escrito"
     DICTAMEN = "dictamen"
     DESCONOCIDO = "desconocido"
-# ======================
-# Settings y tipos
-# ======================
-
-class TipoDocumento(str, Enum):
-    SENTENCIA = "sentencia"
-    FALLO = "fallo"
-    DECRETO = "decreto"
-    RESOLUCION = "resolucion"
-    AUTO = "auto"
-    PROVIDENCIA = "providencia"
-    EXPEDIENTE = "expediente"
-    CONTRATO = "contrato"
-    DEMANDA = "demanda"
-    ESCRITO = "escrito"
-    DICTAMEN = "dictamen"
-    DESCONOCIDO = "desconocido"
-
-
-@dataclass
-class Settings:
-    # Rutas
-    pdf_dir: Path = field(default_factory=lambda: PDF_DIR_DEFAULT)
-    db_dir: Path = field(default_factory=lambda: DB_DIR_DEFAULT)
-    cache_dir: Path = field(default_factory=lambda: CACHE_DIR_DEFAULT)
-    # Chunking
-    chunk_size: int = 600
-    chunk_overlap: int = 120
-    # OCR
-    usar_ocr: bool = True
-    dpi_ocr: int = 300
-    lang_ocr: str = LANG_TESSERACT
-    # Embeddings / RAG
-    embeddings_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    search_k: int = 8
-    # Calidad mínima
-    min_quality_score: float = 0.30
-
-    def ensure_dirs(self) -> None:
-        self.pdf_dir.mkdir(exist_ok=True)
-        self.db_dir.mkdir(exist_ok=True)
-        self.cache_dir.mkdir(exist_ok=True)
-    calidad_ocr: float = 1.0
-    calidad_texto: float = 0.5
-    fragmentos_extraidos: int = 0
-    fragmentos_validos: int = 0
-    score_promedio: float = 0.0
-    metodo_analisis: str = "ingesta_mejorada_autonoma"
-    fecha_ingestion: str = field(default_factory=lambda: datetime.now().isoformat())
-
 
 # ======================
 # Patrones jurídicos
@@ -178,96 +106,45 @@ _PATTERNS = {
     "sentencia": re.compile(r"(?i)\b(sentencia|fallo)\b"),
 }
 
-
 # ======================
-# Extracción de texto
+# Metadata Enriquecida
 # ======================
-
-def _extract_pdfplumber(pdf_path: Path) -> str:
-    if not _HAS_PDFPLUMBER:
-        return ""
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            text = ""
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-        return text
-    except Exception as e:
-        log.warning(f"pdfplumber falló en {pdf_path.name}: {e}")
-        return ""
-
-
-def _extract_ocr(pdf_path: Path, dpi: int = 300, lang: str = LANG_TESSERACT) -> Tuple[str, float]:
-    if not _HAS_OCR_STACK:
-        return "", 0.0
-    try:
-        images = convert_from_path(str(pdf_path), dpi=dpi)
-        chunks, quals = [], []
-        for img in images:
-            txt = pytesseract.image_to_string(img, lang=lang)
-            chunks.append(txt)
-            # Estimate quality based on text length and character diversity
-            qual = min(1.0, len(txt) / 1000.0) if txt.strip() else 0.0
-            quals.append(qual)
-        full_text = "\n".join(chunks)
-        avg_quality = sum(quals) / len(quals) if quals else 0.0
-        return full_text, avg_quality
-    except Exception as e:
-        log.warning(f"OCR falló en {pdf_path.name}: {e}")
-        return "", 0.0
-
-
-def extract_text_from_pdf(pdf_path: Path, settings: Settings) -> str:
-    """Extrae texto combinando métodos: pdfplumber, PyPDF2, OCR opcional."""
-    text = ""
-    
-    # Try pdfplumber first
-    text = _extract_pdfplumber(pdf_path)
-    
-    # If no text, try PyPDF2
-    if not text.strip():
-        text = _extract_pypdf2(pdf_path)
-    
-    # If still no text and OCR is enabled, try OCR
-    if not text.strip() and settings.usar_ocr:
-        ocr_text, _ = _extract_ocr(pdf_path, settings.dpi_ocr, settings.lang_ocr)
-        text = ocr_text
-    
-    return text
-
 
 @dataclass
 class MetadataEnriquecido:
-    """
-    Estructura de metadatos enriquecidos para cada documento jurídico.
-    Incluye trazabilidad, idioma, fuente, tipo y fecha de ingreso.
-    """
-
-    archivo_origen: str                # Nombre del archivo PDF
-    hash_pdf: str                      # Hash MD5 único del PDF
-    materia: str = ""                  # Rama del derecho o base RAG destino
-    fuente: str = ""                   # Origen del documento (jurisprudencia, doctrina, etc.)
-    idioma: str = "es"                 # Idioma detectado o definido
-    tipo_documento: str = ""           # Tipo de documento (fallo, artículo, ley, etc.)
-    resumen: str = ""                  # Resumen breve generado automáticamente o manualmente
-    tokens: int = 0                    # Cantidad de tokens extraídos o procesados
-
-    # 🔒 Nuevos campos de trazabilidad
+    """Metadata completa de documento jurídico"""
+    archivo_origen: str
+    hash_pdf: str
     id_doc: str = field(default_factory=lambda: str(uuid.uuid4()))
     fecha_ingestion: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    # 🧠 Campos opcionales futuros
-    autor: str = ""
-    jurisdiccion: str = ""
-    tribunal: str = ""
-    expediente: str = ""
-    observaciones: str = ""
-    fecha_sentencia: str = ""
-    fecha_resolucion: str = ""
+    # Clasificación
+    materia: str = ""
+    fuente: str = ""
+    tipo_documento: str = ""
 
-    def to_dict(self):
+    # Metadata jurídica
+    tribunal: Optional[str] = None
+    expediente: Optional[str] = None
+    jurisdiccion: str = ""
+    fecha_sentencia: Optional[str] = None
+    fecha_resolucion: Optional[str] = None
+
+    # Metadata documental
+    autor: str = ""
+    idioma: str = "es"
+    resumen: str = ""
+
+    # Estadísticas
+    tokens: int = 0
+    fragmentos_extraidos: int = 0
+    fragmentos_validos: int = 0
+    score_promedio: float = 0.0
+
+    # Observaciones
+    observaciones: str = ""
+
+    def to_dict(self) -> dict:
         return {
             "id_doc": self.id_doc,
             "archivo_origen": self.archivo_origen,
@@ -285,11 +162,35 @@ class MetadataEnriquecido:
             "observaciones": self.observaciones,
             "fecha_ingestion": self.fecha_ingestion,
             "fecha_sentencia": self.fecha_sentencia,
-            "fecha_resolucion": self.fecha_resolucion
+            "fecha_resolucion": self.fecha_resolucion,
+            "fragmentos_extraidos": self.fragmentos_extraidos,
+            "fragmentos_validos": self.fragmentos_validos,
+            "score_promedio": self.score_promedio
         }
+
+# ======================
+# Extracción de texto
+# ======================
+
+def _extract_pdfplumber(pdf_path: Path) -> str:
+    """Extrae texto usando pdfplumber"""
+    if not _HAS_PDFPLUMBER:
+        return ""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = ""
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        return text
+    except Exception as e:
+        log.warning(f"pdfplumber falló en {pdf_path.name}: {e}")
+        return ""
 
 
 def _extract_pypdf2(pdf_path: Path) -> str:
+    """Extrae texto usando PyPDF2"""
     if not _HAS_PYPDF2:
         return ""
     try:
@@ -306,18 +207,55 @@ def _extract_pypdf2(pdf_path: Path) -> str:
         return ""
 
 
+def _extract_ocr(pdf_path: Path, config: IngestaConfig) -> Tuple[str, float]:
+    """Extrae texto con OCR"""
+    if not _HAS_OCR_STACK:
+        return "", 0.0
+    try:
+        images = convert_from_path(str(pdf_path), dpi=config.dpi_ocr)
+        chunks, quals = [], []
+        for img in images:
+            txt = pytesseract.image_to_string(img, lang=config.lang_ocr)
+            chunks.append(txt)
+            qual = min(1.0, len(txt) / 1000.0) if txt.strip() else 0.0
+            quals.append(qual)
+        full_text = "\n".join(chunks)
+        avg_quality = sum(quals) / len(quals) if quals else 0.0
+        return full_text, avg_quality
+    except Exception as e:
+        log.warning(f"OCR falló en {pdf_path.name}: {e}")
+        return "", 0.0
 
 
+def extract_text_from_pdf(pdf_path: Path, config: IngestaConfig = DEFAULT_INGESTA_CONFIG) -> str:
+    """Extrae texto combinando métodos disponibles"""
+    text = ""
+
+    # 1. Intentar pdfplumber primero
+    text = _extract_pdfplumber(pdf_path)
+
+    # 2. Si falla, intentar PyPDF2
+    if not text.strip():
+        text = _extract_pypdf2(pdf_path)
+
+    # 3. Si aún falla y OCR está habilitado, usar OCR
+    if not text.strip() and config.usar_ocr:
+        ocr_text, _ = _extract_ocr(pdf_path, config)
+        text = ocr_text
+
+    return text
 
 # ======================
 # Validación y clasificación
 # ======================
 
 def validate_pdf(pdf_path: Path) -> bool:
-    """Valida existencia, tamaño y encabezado básico."""
+    """Valida que el PDF sea válido"""
     try:
-        if not pdf_path.exists(): return False
-        if pdf_path.stat().st_size < 1024: return False
+        if not pdf_path.exists():
+            return False
+        if pdf_path.stat().st_size < 1024:
+            return False
         with open(pdf_path, "rb") as f:
             head = f.read(4)
         return head == b"%PDF"
@@ -326,38 +264,78 @@ def validate_pdf(pdf_path: Path) -> bool:
 
 
 def classify_document(text: str) -> str:
-    """Clasifica tipo jurídico básico por reglas rápidas."""
+    """Clasifica tipo de documento jurídico"""
     low = text.lower()
-    if re.search(_PATTERNS["sentencia"], low): return TipoDocumento.SENTENCIA.value
-    if "decreto" in low: return TipoDocumento.DECRETO.value
-    if "resolución" in low or "resolucion" in low: return TipoDocumento.RESOLUCION.value
-    if re.search(_PATTERNS["expediente"], low): return TipoDocumento.EXPEDIENTE.value
+    if re.search(_PATTERNS["sentencia"], low):
+        return TipoDocumento.SENTENCIA.value
+    if "decreto" in low:
+        return TipoDocumento.DECRETO.value
+    if "resolución" in low or "resolucion" in low:
+        return TipoDocumento.RESOLUCION.value
+    if re.search(_PATTERNS["expediente"], low):
+        return TipoDocumento.EXPEDIENTE.value
     return TipoDocumento.DESCONOCIDO.value
 
 
+def detect_metadata_enriched(pdf_path: Path, text: str) -> MetadataEnriquecido:
+    """Extrae metadatos del PDF y texto"""
+    # Hash del PDF
+    with open(pdf_path, "rb") as f:
+        h = hashlib.md5(f.read()).hexdigest()
+
+    meta = MetadataEnriquecido(archivo_origen=pdf_path.name, hash_pdf=h)
+    meta.tipo_documento = classify_document(text)
+
+    # Expediente
+    mexp = re.search(_PATTERNS["expediente"], text)
+    meta.expediente = mexp.group(2) if mexp else None
+
+    # Fechas
+    mfecha = re.search(_PATTERNS["fecha"], text)
+    if mfecha:
+        fstr = mfecha.group(0)
+        if meta.tipo_documento == TipoDocumento.SENTENCIA.value:
+            meta.fecha_sentencia = fstr
+        else:
+            meta.fecha_resolucion = fstr
+
+    # Tribunal
+    mtrib = re.search(_PATTERNS["tribunal"], text)
+    meta.tribunal = mtrib.group(0) if mtrib else None
+
+    return meta
+
+# ======================
+# Segmentación jurídica
+# ======================
+
 def _estimate_quality(text: str) -> float:
-    """Score simple de calidad de fragmento: tamaño + señales jurídicas."""
-    if not text: return 0.0
+    """Score de calidad de fragmento"""
+    if not text:
+        return 0.0
     n = len(text.split())
     score = 0.3 if n >= 20 else 0.0
-    if 80 <= n <= 1200: score += 0.3
-    # señales
+    if 80 <= n <= 1200:
+        score += 0.3
+    # Señales jurídicas
     hits = sum(1 for k in ("considerando", "artículo", "articulo", "resuelve", "sentencia") if k in text.lower())
     score += min(0.4, hits * 0.1)
     return max(0.0, min(1.0, score))
 
 
-def _segment_legal(text: str, settings: Settings) -> List[Document]:
-    """Segmentación jurídica avanzada preservando tipos (considerando, artículo, resolutivo, párrafo)."""
+def _segment_legal(text: str, config: IngestaConfig) -> List[Document]:
+    """Segmentación jurídica con preservación de estructura"""
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
         separators=["\n\n", "\n", ". "]
     )
-    # Marca de tipo aproximada por líneas pivote
+
+    # Detectar tipo de línea
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     buckets: List[Tuple[str, List[str]]] = []
     current_type, buf = "parrafo", []
+
     def flush():
         nonlocal buf, current_type, buckets
         if buf:
@@ -365,7 +343,6 @@ def _segment_legal(text: str, settings: Settings) -> List[Document]:
             buf = []
 
     for ln in lines:
-        lt = ln.lower()
         ntype = ("considerando" if re.match(_PATTERNS["considerando"], ln)
                  else "articulo" if re.match(_PATTERNS["articulo"], ln)
                  else "resolutivo" if re.match(_PATTERNS["resolutivo"], ln)
@@ -376,144 +353,86 @@ def _segment_legal(text: str, settings: Settings) -> List[Document]:
         buf.append(ln)
     flush()
 
+    # Chunking por tipo
     docs: List[Document] = []
     for t, lines_block in buckets:
         big_block = "\n".join(lines_block)
         for chunk in splitter.split_text(big_block):
             q = _estimate_quality(chunk)
-            if q < settings.min_quality_score:
+            if q < config.min_quality_score:
                 continue
-            docs.append(Document(page_content=chunk, metadata={"tipo_estructura": t, "score_calidad": q}))
+            docs.append(Document(
+                page_content=chunk,
+                metadata={"tipo_estructura": t, "score_calidad": q}
+            ))
+
     return docs
 
 
-def detect_metadata_enriched(pdf_path: Path, text: str) -> MetadataEnriquecido:
-    """Extrae metadatos clave (expediente, tribunal, fechas, tipo_documento, etc.)."""
-    # Hash
-    with open(pdf_path, "rb") as f:
-        h = hashlib.md5(f.read()).hexdigest()
-
-    meta = MetadataEnriquecido(archivo_origen=pdf_path.name, hash_pdf=h)
-    meta.tipo_documento = classify_document(text)
-    # Expediente
-    mexp = re.search(_PATTERNS["expediente"], text)
-    meta.expediente = mexp.group(2) if mexp else None
-    # Fechas
-    mfecha = re.search(_PATTERNS["fecha"], text)
-    if mfecha:
-        fstr = mfecha.group(0)
-        if meta.tipo_documento == TipoDocumento.SENTENCIA.value:
-            meta.fecha_sentencia = fstr
-        else:
-            meta.fecha_resolucion = fstr
-    # Tribunal aprox
-    mtrib = re.search(_PATTERNS["tribunal"], text)
-    meta.tribunal = mtrib.group(0) if mtrib else None
-    return meta
-
-
-# ======================
-# Vectorstore (Chroma)
-# ======================
-
-def _ensure_vectorstore(db_dir: Path, embeddings_model: str) -> Chroma:
-
-    # ============================================================
-    # Crear el vectorstore con detección de dimensión segura
-    # ============================================================
-    embeddings = SentenceTransformerEmbeddings(model_name=embeddings_model)
-
-    # Detección de dimensión (compatible con versiones viejas y nuevas)
-    try:
-        if hasattr(embeddings, "_client"):
-            model_ref = embeddings._client
-        elif hasattr(embeddings, "client"):
-            model_ref = embeddings.client
-        else:
-            model_ref = None
-
-        if model_ref and hasattr(model_ref, "get_sentence_embedding_dimension"):
-            dim = model_ref.get_sentence_embedding_dimension()
-        elif model_ref and hasattr(model_ref, "encode"):
-            # Método alternativo: generar embedding de prueba
-            test_vec = model_ref.encode("dim_test")
-            dim = len(test_vec)
-        else:
-            dim = "desconocida"
-    except Exception:
-        dim = "desconocida"
-
-    print(f"[Chroma] Creando vectorstore en {db_dir} con modelo: {embeddings_model} (dim={dim})")
-
-    vs = Chroma(
-        collection_name="legal_fragments",
-        embedding_function=embeddings,
-        persist_directory=str(db_dir)
-    )
-    return vs
-
-
 def _dedup_by_hash(docs: List[Document]) -> List[Document]:
+    """Deduplica fragmentos por hash MD5"""
     seen = set()
     out: List[Document] = []
     for d in docs:
         h = hashlib.md5(d.page_content.encode("utf-8")).hexdigest()
-        if h in seen: 
+        if h in seen:
             continue
         seen.add(h)
         d.metadata["hash_fragmento"] = h
         out.append(d)
     return out
 
-
 # ======================
-# Pipeline principal
+# Pipeline principal con versionado
 # ======================
 
 def ingest_pdf_to_chroma(
     pdf_path: Path,
     base_nombre: str,
-    materia: Optional[str],
-    settings: Optional[Settings] = None
+    materia: Optional[str] = None,
+    config: IngestaConfig = DEFAULT_INGESTA_CONFIG
 ) -> Dict[str, Any]:
     """
-    Ingiera un PDF:
-      - Valida PDF
-      - Extrae texto (con OCR opcional)
-      - Segmenta jurídicamente
-      - Valida + dedup
-      - Inserta en Chroma con metadatos enriquecidos
+    Ingesta PDF con versionado automático.
+
+    Args:
+        pdf_path: Ruta al PDF
+        base_nombre: Nombre de la base (ej: "Salud - Médica")
+        materia: Materia/rama del derecho
+        config: Configuración de ingesta
+
+    Returns:
+        Diccionario con resultado
     """
-    settings = settings or Settings()
-    settings.ensure_dirs()
     assert base_nombre in BASES_RAG, f"Base desconocida: {base_nombre}"
 
+    # 1. Validar PDF
     if not validate_pdf(pdf_path):
         return {"ok": False, "error": "PDF inválido o dañado"}
 
-    text = extract_text_from_pdf(pdf_path, settings)
+    # 2. Extraer texto
+    text = extract_text_from_pdf(pdf_path, config)
     if not text.strip():
-        return {"ok": False, "error": "Sin texto utilizable (ni OCR)"}
+        return {"ok": False, "error": "Sin texto utilizable"}
 
-    # Segmentación legal
-    docs = _segment_legal(text, settings)
-
+    # 3. Segmentar
+    docs = _segment_legal(text, config)
     if not docs:
         return {"ok": False, "error": "Segmentación sin fragmentos válidos"}
 
+    # 4. Deduplicar
     docs = _dedup_by_hash(docs)
 
-    # Metadatos enriquecidos (a nivel doc)
+    # 5. Metadata enriquecida
     meta_doc = detect_metadata_enriched(pdf_path, text)
-    meta_doc.materia = materia
+    meta_doc.materia = materia or base_nombre
     meta_doc.fragmentos_extraidos = len(docs)
 
-    # Score promedio simple
     if docs:
         meta_doc.score_promedio = sum(d.metadata.get("score_calidad", 0.5) for d in docs) / len(docs)
         meta_doc.fragmentos_validos = len(docs)
 
-    # Asignar metadatos globales a cada fragmento
+    # 6. Asignar metadata a cada fragmento
     for d in docs:
         d.metadata.update({
             "archivo_origen": meta_doc.archivo_origen,
@@ -527,27 +446,69 @@ def ingest_pdf_to_chroma(
             "fecha_ingestion": meta_doc.fecha_ingestion,
             "base_nombre": base_nombre
         })
-    # Persistir en Chroma
-    vs = _ensure_vectorstore(settings.db_dir / BASES_RAG[base_nombre], settings.embeddings_model)
-    vs.add_documents(docs)  # En Chroma 0.4+ persiste solo
-    return {"ok": True, "base": base_nombre, "n_fragmentos": len(docs), "metadata": meta_doc.to_dict()}
 
+    # 7. Gestionar versión
+    active_version = REGISTRY.get_active_version(base_nombre)
+
+    if not active_version:
+        # Primera versión de esta base
+        active_version = "1.0.0"
+        version_dir = create_version_directory(base_nombre, active_version)
+
+        # Registrar versión inicial
+        version_meta = BaseVersion(
+            version=active_version,
+            embedding_model=config.embeddings_model if hasattr(config, 'embeddings_model') else VALIDATOR._embedding_cache.keys().__iter__().__next__() if VALIDATOR._embedding_cache else "sentence-transformers/all-mpnet-base-v2",
+            embedding_dim=768,
+            total_docs=1,
+            total_fragments=len(docs),
+            created_at=datetime.now().isoformat(),
+            last_updated=datetime.now().isoformat(),
+            migration_from=None,
+            quality_score=meta_doc.score_promedio,
+            is_active=True
+        )
+        REGISTRY.register_version(base_nombre, version_meta)
+    else:
+        version_dir = get_version_directory(base_nombre, active_version)
+
+    # 8. Cargar/crear vectorstore
+    embeddings = VALIDATOR.get_embeddings()
+    vs = Chroma(
+        collection_name="legal_fragments",
+        embedding_function=embeddings,
+        persist_directory=str(version_dir)
+    )
+
+    # 9. Insertar documentos
+    vs.add_documents(docs)
+
+    log.info(f"✅ Ingesta exitosa: {pdf_path.name} → {base_nombre} v{active_version} ({len(docs)} fragmentos)")
+
+    return {
+        "ok": True,
+        "base": base_nombre,
+        "version": active_version,
+        "n_fragmentos": len(docs),
+        "metadata": meta_doc.to_dict()
+    }
 
 # ======================
-# CLI (opcional)
+# CLI
 # ======================
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Ingesta mejorada autónoma (jurídica)")
+    ap = argparse.ArgumentParser(description="Ingesta mejorada con versionado")
     ap.add_argument("--pdf", required=True, help="Ruta al PDF")
     ap.add_argument("--base", required=True, choices=list(BASES_RAG.keys()))
     ap.add_argument("--materia", default=None)
     ap.add_argument("--no-ocr", action="store_true", help="Desactiva OCR")
-    ap.add_argument("--model", default=None, help="Modelo embeddings HuggingFace")
     args = ap.parse_args()
 
-    st = Settings(usar_ocr=not args.no_ocr)
-    if args.model: st.embeddings_model = args.model
-    res = ingest_pdf_to_chroma(Path(args.pdf), args.base, args.materia, st)
+    config = DEFAULT_INGESTA_CONFIG
+    if args.no_ocr:
+        config.usar_ocr = False
+
+    res = ingest_pdf_to_chroma(Path(args.pdf), args.base, args.materia, config)
     print(json.dumps(res, ensure_ascii=False, indent=2))

@@ -1,4 +1,3 @@
-# app_streamlit_salud.py
 # -*- coding: utf-8 -*-
 """
 INTERFAZ STREAMLIT - Analizador Jurídico-Sanitario (Gemini Pro + RAG)
@@ -9,167 +8,278 @@ Permite:
 ✅ Ver auditorías vectoriales.
 ✅ Generar informe PDF.
 ✅ Guardar y revisar historial de consultas.
+✅ Sistema de versionado integrado.
 """
 
 import streamlit as st
 from pathlib import Path
-import json, os
+import json, os, tempfile
 from datetime import datetime
+
+# Imports del sistema refactorizado
+from config import BASES_RAG, DEFAULT_LLM
 from analyser_salud import (
-    _make_llm, _load_all_retrievers, analyse_text_medico,
-    analyse_pdf_medico, render_pdf_report, _audit_vectorstore,
-    BASES_RAG, DB_DIR_DEFAULT, DEFAULT_LLM
+    make_llm, load_all_retrievers, analyse_text_medico,
+    analyse_pdf_medico, render_pdf_report, audit_vectorstore,
+    analyse_deep_layer
 )
+from version_manager import REGISTRY
 
 # ============================================================
-# MANEJO DE SESSION STATE SEGURO
+# CONFIGURACIÓN
 # ============================================================
-if "uploaded_pdf" not in st.session_state:
-    st.session_state["uploaded_pdf"] = None
-if "analisis_resultado" not in st.session_state:
-    st.session_state["analisis_resultado"] = None
-if "texto_analisis" not in st.session_state:
-    st.session_state["texto_analisis"] = ""
-
-# ======================
-# CONFIGURACIÓN BASE
-# ======================
 
 st.set_page_config(page_title="Analizador Jurídico-Sanitario", layout="wide")
 st.title("🧠 Analizador Jurídico-Sanitario (Gemini Pro + RAG)")
 
 HISTORIAL_PATH = Path("historial_salud.json")
 
-# ======================
-# CLAVE GEMINI
-# ======================
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "analisis_resultado" not in st.session_state:
+    st.session_state["analisis_resultado"] = None
+if "texto_analisis" not in st.session_state:
+    st.session_state["texto_analisis"] = ""
+if "llm" not in st.session_state:
+    st.session_state["llm"] = None
+if "retrievers" not in st.session_state:
+    st.session_state["retrievers"] = None
+
+# ============================================================
+# VALIDACIÓN DE API KEY
+# ============================================================
+
 if "GOOGLE_API_KEY" not in os.environ or not os.environ["GOOGLE_API_KEY"].strip():
     st.warning("⚠️ Falta configurar GOOGLE_API_KEY en el entorno.")
+    st.info("Configura la variable de entorno GOOGLE_API_KEY antes de usar la aplicación.")
+    st.stop()
 else:
     st.success("🔐 Clave de API de Gemini detectada.")
 
-# ======================
-# CARGA MODELO Y BASES
-# ======================
-try:
-    llm = _make_llm(model=DEFAULT_LLM)
-    retrievers = _load_all_retrievers(DB_DIR_DEFAULT, BASES_RAG)
-    if not retrievers:
-        st.error("No se encontraron bases vectoriales en 'chroma_db_legal/*'.")
-    else:
-        st.info(f"📚 Bases disponibles: {', '.join(retrievers.keys())}")
-except Exception as e:
-    st.error(f"Error al inicializar: {e}")
-    st.stop()
+# ============================================================
+# INICIALIZACIÓN (con caché)
+# ============================================================
 
-# ======================
+@st.cache_resource
+def init_system():
+    """Inicializa LLM y retrievers (cached)"""
+    try:
+        llm = make_llm(model=DEFAULT_LLM)
+        retrievers = load_all_retrievers(BASES_RAG)
+        return llm, retrievers
+    except Exception as e:
+        st.error(f"Error al inicializar sistema: {e}")
+        return None, None
+
+llm, retrievers = init_system()
+
+if not retrievers:
+    st.error("No se encontraron bases vectoriales en 'chroma_db_legal/*'.")
+    st.info("Ejecuta la ingesta de documentos primero.")
+    st.stop()
+else:
+    # Mostrar información de versiones
+    with st.expander("📚 Bases disponibles y versiones"):
+        for base_name in BASES_RAG.keys():
+            active_version = REGISTRY.get_active_version(base_name)
+            if active_version:
+                meta = REGISTRY.get_version(base_name, active_version)
+                st.write(f"**{base_name}**: v{active_version} ({meta.embedding_model}, {meta.total_fragments} fragmentos)")
+            else:
+                st.write(f"**{base_name}**: Sin versión activa")
+
+# ============================================================
 # MODO DE ANÁLISIS
-# ======================
+# ============================================================
+
 modo = st.radio("Seleccioná el modo de análisis:", ["Consulta", "Archivo PDF"])
-texto = ""
+
 result = {}
-auditorias = []
+texto = ""
 
 if modo == "Consulta":
     query = st.text_area("📝 Escribí tu consulta o caso médico:", height=200)
     if st.button("🔍 Analizar texto"):
         with st.spinner("Analizando..."):
-            result = analyse_text_medico(query, retrievers, llm)
-            texto = query
+            try:
+                result = analyse_text_medico(query, retrievers, llm)
+                texto = query
+                st.session_state["analisis_resultado"] = result
+                st.session_state["texto_analisis"] = texto
+            except Exception as e:
+                st.error(f"Error en análisis: {e}")
 
 elif modo == "Archivo PDF":
     pdf_file = st.file_uploader("📄 Subí un archivo PDF", type=["pdf"])
     if pdf_file and st.button("🔍 Analizar PDF"):
-        tmp = Path("temp_input.pdf")
-        tmp.write_bytes(pdf_file.read())
-        with st.spinner("Extrayendo texto y analizando..."):
-            result = analyse_pdf_medico(tmp, retrievers, llm)
-            texto = f"PDF subido: {pdf_file.name}"
+        # Usar archivo temporal
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_file.read())
+            tmp_path = Path(tmp.name)
 
-# ======================
-# MOSTRAR RESULTADOS ENRIQUECIDOS
-# ======================
+        with st.spinner("Extrayendo texto y analizando..."):
+            try:
+                result = analyse_pdf_medico(tmp_path, retrievers, llm)
+                texto = f"PDF subido: {pdf_file.name}"
+                st.session_state["analisis_resultado"] = result
+                st.session_state["texto_analisis"] = texto
+            except Exception as e:
+                st.error(f"Error en análisis: {e}")
+            finally:
+                # Limpiar archivo temporal
+                tmp_path.unlink(missing_ok=True)
+
+# Recuperar de session state si existe
+if st.session_state["analisis_resultado"]:
+    result = st.session_state["analisis_resultado"]
+    texto = st.session_state["texto_analisis"]
+
+# ============================================================
+# MOSTRAR RESULTADOS
+# ============================================================
 
 if result:
-    st.subheader("📋 Resumen estructurado (síntesis del modelo)")
-    resumen = {
-        "Tesis": result.get("tesis"),
-        "Conceptos clave": result.get("conceptos_clave"),
-        "Debilidades": result.get("debilidades"),
-        "Preguntas derivadas": result.get("preguntas"),
-    "Probabilidad de éxito": result.get("probabilidad_exito"),
-    }
-    st.json(resumen, expanded=False)
+    st.markdown("---")
+    st.subheader("📋 Resumen estructurado")
 
-    # 🔍 Informe narrativo completo
+    # Resumen en columnas
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.metric("Probabilidad de éxito", result.get("probabilidad_exito", "media").upper())
+
+    with col2:
+        fuentes = result.get("fuentes_relevantes", [])
+        st.metric("Fuentes citadas", len(fuentes))
+
+    # Tesis
+    st.markdown("### 🎯 Tesis")
+    st.info(result.get("tesis", "(sin tesis)"))
+
+    # Conceptos clave
+    conceptos = result.get("conceptos_clave", [])
+    if conceptos:
+        st.markdown("### 🔑 Conceptos clave")
+        for concepto in conceptos:
+            st.markdown(f"- {concepto}")
+
+    # Debilidades
+    debilidades = result.get("debilidades", [])
+    if debilidades:
+        st.markdown("### ⚠️ Debilidades")
+        for deb in debilidades:
+            st.markdown(f"- {deb}")
+
+    # Preguntas derivadas
+    preguntas = result.get("preguntas", [])
+    if preguntas:
+        st.markdown("### ❓ Preguntas derivadas")
+        for preg in preguntas:
+            st.markdown(f"- {preg}")
+
+    # Informe narrativo completo
     if "texto_completo" in result and result["texto_completo"].strip():
-        st.markdown("### 🧠 Análisis completo de Gemini (con citas y trazabilidad)")
-        st.markdown(result["texto_completo"])
+        with st.expander("📄 Ver análisis completo de Gemini"):
+            st.markdown(result["texto_completo"])
 
-    # 🔗 Fuentes relevantes reutilizables
-    fuentes = result.get("fuentes_relevantes", [])
+    # Fuentes relevantes
     if fuentes:
-        st.markdown("### 🔗 Fuentes relevantes detectadas")
-        st.table([
-            {
-                "Autor": f.get("autor", ""),
-                "Título": f.get("titulo", ""),
-                "Año": f.get("anio", ""),
-                "Página": f.get("pagina", ""),
-                "Tipo": f.get("tipo", ""),
-                "URL": f.get("url", "")
-            } for f in fuentes
-        ])
-        st.info("💡 Podés reutilizar estas referencias en consultas posteriores o análisis comparativos.")
+        with st.expander("🔗 Fuentes relevantes detectadas"):
+            for i, f in enumerate(fuentes, 1):
+                st.markdown(f"**{i}. {f.get('autor', '?')}** – *{f.get('titulo', '?')}* ({f.get('anio', 's/f')})")
+                if f.get('pagina'):
+                    st.caption(f"Página: {f['pagina']}")
+                if f.get('url'):
+                    st.caption(f"URL: {f['url']}")
+                if f.get('tipo'):
+                    st.caption(f"Tipo: {f['tipo']}")
+                st.markdown("---")
 
-    # Auditorías vectoriales
+    # ============================================================
+    # AUDITORÍAS VECTORIALES
+    # ============================================================
+
     st.markdown("---")
     st.subheader("🧮 Auditoría de bases vectoriales utilizadas")
-    auditorias = [_audit_vectorstore(vs, nombre) for nombre, vs in retrievers.items()]
-    st.dataframe(
-        [{"Base": a.base, "Fragments": a.frags, "Avg Words": a.avg_words,
-          "Diversidad": a.diversity, "Cobertura": a.coverage_types, "Rating": a.rating}
-         for a in auditorias],
-        use_container_width=True
-    )
 
-    # 📥 Generar informe PDF completo
-    if st.button("📥 Generar reporte PDF con fuentes"):
-        out_path = Path("reporte_sanitario_fuentes.pdf")
-        titulo = f"Informe Jurídico-Sanitario con Fuentes (Nivel {result.get('nivel',1)})"
-        st.info(f"[LOG] Creando PDF en: {out_path}")
+    auditorias = []
+    for nombre, vs in retrievers.items():
+        audit = audit_vectorstore(vs, nombre)
+        auditorias.append(audit)
+
+    # Tabla de auditorías
+    audit_data = []
+    for a in auditorias:
+        audit_data.append({
+            "Base": a.base,
+            "Fragmentos": a.frags,
+            "Palabras prom.": f"{a.avg_words:.1f}",
+            "Diversidad": f"{a.diversity:.2%}",
+            "Cobertura": f"{a.coverage_types:.2%}",
+            "Rating": f"{a.rating:.2f}/5.0"
+        })
+
+    st.table(audit_data)
+
+    # ============================================================
+    # GENERAR PDF
+    # ============================================================
+
+    st.markdown("---")
+    if st.button("📥 Generar reporte PDF"):
+        output_path = Path(tempfile.gettempdir()) / f"reporte_sanitario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        titulo = f"Informe Jurídico-Sanitario (Nivel {result.get('nivel', 1)})"
+
         try:
-            render_pdf_report(out_path, titulo, texto, result, auditorias)
-            st.info(f"[LOG] PDF generado exitosamente: {out_path.exists()}")
-            if out_path.exists():
-                with open(out_path, "rb") as f:
-                    st.download_button("⬇️ Descargar PDF", f, file_name="reporte_sanitario_fuentes.pdf")
-                    st.success("[LOG] PDF listo para descargar.")
+            render_pdf_report(output_path, titulo, texto, result, auditorias)
+
+            if output_path.exists():
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        "⬇️ Descargar PDF",
+                        f,
+                        file_name=output_path.name,
+                        mime="application/pdf"
+                    )
+                st.success("✅ PDF generado exitosamente")
             else:
-                st.error("[LOG] Error: El archivo PDF no se creó correctamente.")
+                st.error("❌ Error: El archivo PDF no se creó")
+
         except Exception as e:
-            st.error(f"[LOG] Error al generar o descargar PDF: {e}")
+            st.error(f"❌ Error al generar PDF: {e}")
 
-    # Guardar en historial
+    # ============================================================
+    # GUARDAR EN HISTORIAL
+    # ============================================================
+
     if st.button("💾 Guardar en historial"):
-        registro = {
-            "timestamp": datetime.now().isoformat(),
-            "modo": modo,
-            "entrada": texto[:400],
-            "resultado": result,
-            "auditorias": [a.__dict__ for a in auditorias],
-        }
-        if HISTORIAL_PATH.exists():
-            data = json.loads(HISTORIAL_PATH.read_text(encoding="utf-8"))
-        else:
-            data = []
-        data.append(registro)
-        HISTORIAL_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        st.success("✅ Consulta guardada en historial.")
+        try:
+            registro = {
+                "timestamp": datetime.now().isoformat(),
+                "modo": modo,
+                "entrada": texto[:400],
+                "resultado": result,
+                "auditorias": [a.__dict__ for a in auditorias],
+            }
 
-    # ======================
+            if HISTORIAL_PATH.exists():
+                data = json.loads(HISTORIAL_PATH.read_text(encoding="utf-8"))
+            else:
+                data = []
+
+            data.append(registro)
+            HISTORIAL_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.success("✅ Consulta guardada en historial")
+
+        except Exception as e:
+            st.error(f"❌ Error guardando historial: {e}")
+
+    # ============================================================
     # ANÁLISIS AVANZADO / ITERATIVO
-    # ======================
+    # ============================================================
+
     st.markdown("---")
     st.subheader("🔎 Análisis Avanzado / Iterativo")
 
@@ -178,15 +288,14 @@ if result:
     if st.button("🧠 Generar análisis avanzado"):
         with st.spinner("Profundizando el análisis jurídico..."):
             try:
-                # Determinamos el nivel según si el resultado ya contiene un campo 'nivel'
                 nivel_actual = int(result.get("nivel", 1)) + 1
-                from analyser_salud import analyse_deep_layer
                 result_deep = analyse_deep_layer(result, llm, pregunta, nivel=nivel_actual)
                 result_deep["nivel"] = nivel_actual
-                st.success(f"✅ Análisis avanzado generado (Nivel {nivel_actual})")
-                st.json(result_deep, expanded=False)
 
-                # Guardamos la iteración en historial extendido
+                st.success(f"✅ Análisis avanzado generado (Nivel {nivel_actual})")
+                st.json(result_deep)
+
+                # Guardar automáticamente
                 registro = {
                     "timestamp": datetime.now().isoformat(),
                     "modo": "Iterativo",
@@ -194,38 +303,84 @@ if result:
                     "entrada": pregunta[:400],
                     "resultado": result_deep,
                 }
+
                 if HISTORIAL_PATH.exists():
                     data = json.loads(HISTORIAL_PATH.read_text(encoding="utf-8"))
                 else:
                     data = []
+
                 data.append(registro)
                 HISTORIAL_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
             except Exception as e:
-                st.error(f"Error en análisis avanzado: {e}")
+                st.error(f"❌ Error en análisis avanzado: {e}")
 
-# ======================
+# ============================================================
 # PANEL DE HISTORIAL
-# ======================
+# ============================================================
+
 st.markdown("---")
 st.subheader("🗂️ Historial de análisis anteriores")
 
 if HISTORIAL_PATH.exists():
-    data = json.loads(HISTORIAL_PATH.read_text(encoding="utf-8"))
-    if data:
-        opciones = [f"{i+1}. {d['timestamp']} - {d['modo']} (Nivel {d.get('nivel',1)})" for i, d in enumerate(data)]
-        seleccion = st.selectbox("Seleccioná un análisis previo:", opciones)
-        idx = opciones.index(seleccion)
-        anterior = data[idx]
-        if st.button("📖 Ver detalle del análisis seleccionado"):
-            st.json(anterior["resultado"])
-        if st.button("📤 Exportar análisis a PDF"):
-            out_path = Path(f"reporte_{idx+1}.pdf")
-            render_pdf_report(out_path, "Informe Sanitario (Historial)", anterior["entrada"],
-                              anterior["resultado"], [])
-            with open(out_path, "rb") as f:
-                st.download_button("⬇️ Descargar PDF", f, file_name=out_path.name)
-    else:
-        st.info("📭 No hay análisis guardados aún.")
+    try:
+        data = json.loads(HISTORIAL_PATH.read_text(encoding="utf-8"))
+
+        if data:
+            opciones = [
+                f"{i+1}. {d['timestamp']} - {d['modo']} (Nivel {d.get('nivel', 1)})"
+                for i, d in enumerate(data)
+            ]
+
+            seleccion = st.selectbox("Seleccioná un análisis previo:", opciones)
+            idx = opciones.index(seleccion)
+            anterior = data[idx]
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                if st.button("📖 Ver detalle"):
+                    st.json(anterior["resultado"])
+
+            with col2:
+                if st.button("📤 Exportar a PDF"):
+                    output_path = Path(tempfile.gettempdir()) / f"reporte_historial_{idx+1}.pdf"
+                    try:
+                        render_pdf_report(
+                            output_path,
+                            "Informe Sanitario (Historial)",
+                            anterior["entrada"],
+                            anterior["resultado"],
+                            []
+                        )
+
+                        with open(output_path, "rb") as f:
+                            st.download_button(
+                                "⬇️ Descargar PDF",
+                                f,
+                                file_name=output_path.name,
+                                mime="application/pdf"
+                            )
+
+                    except Exception as e:
+                        st.error(f"Error exportando: {e}")
+
+        else:
+            st.info("📭 No hay análisis guardados aún.")
+
+    except Exception as e:
+        st.error(f"Error cargando historial: {e}")
 else:
     st.info("📭 Aún no existe historial.")
+
+# ============================================================
+# FOOTER CON INFO DEL SISTEMA
+# ============================================================
+
+st.markdown("---")
+with st.expander("ℹ️ Información del sistema"):
+    stats = REGISTRY.get_stats()
+    st.write(f"**Bases registradas:** {stats['total_bases']}")
+    st.write(f"**Versiones totales:** {stats['total_versions']}")
+    st.write(f"**Modelos en uso:** {', '.join(stats['models_in_use']) if stats['models_in_use'] else 'Ninguno'}")
+    st.write(f"**LLM:** {DEFAULT_LLM}")
